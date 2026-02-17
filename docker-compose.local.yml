@@ -1,0 +1,159 @@
+# docker-compose.local.yml
+#
+# Full local stack for RTX 4080 Super (16 GB VRAM).
+#
+# IMPORTANT: Ollama and vLLM both need the GPU. Run ONE at a time
+# unless you use separate GPU profiles, or use the partial targets:
+#
+#   make docker-up-rag       # Ollama + RAG API  (for Approach 1)
+#   make docker-up-finetune  # vLLM + FT API     (for Approach 2)
+#   make docker-up           # Start everything  (see NVIDIA_VISIBLE_DEVICES note)
+
+services:
+  # ────────────────────────────────────────────
+  # Approach 1: RAG
+  # ────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: pqg-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    entrypoint: >
+      sh -c "ollama serve &
+             sleep 5 &&
+             ollama pull deepseek-coder:6.7b-instruct &&
+             wait"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    profiles:
+      - rag
+      - all
+
+  rag-api:
+    build:
+      context: .
+      dockerfile: approach1_rag/Dockerfile
+    container_name: pqg-rag-api
+    ports:
+      - "8080:8080"
+    environment:
+      - LLM_BASE_URL=http://ollama:11434/v1
+      - LLM_MODEL=deepseek-coder:6.7b-instruct
+      - FAISS_INDEX_PATH=data/faiss_index
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+    profiles:
+      - rag
+      - all
+
+  # ────────────────────────────────────────────
+  # Approach 2: Fine-tuned model
+  # ────────────────────────────────────────────
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: pqg-vllm
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models:/models
+      - ./outputs:/outputs
+      - huggingface_cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HOME=/root/.cache/huggingface
+    # Serve the base model with quantization for 16 GB VRAM.
+    # After training, change to: --model /outputs/merged_model  (and remove --quantization)
+    command: >
+      --model deepseek-ai/deepseek-coder-6.7b-instruct
+      --host 0.0.0.0
+      --port 8000
+      --gpu-memory-utilization 0.85
+      --max-model-len 4096
+      --quantization awq
+      --trust-remote-code
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/models"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+    profiles:
+      - finetune
+      - all
+
+  finetune-api:
+    build:
+      context: .
+      dockerfile: approach2_finetune/Dockerfile
+    container_name: pqg-finetune-api
+    ports:
+      - "8081:8081"
+    environment:
+      - VLLM_HOST=vllm
+      - VLLM_PORT=8000
+      - BASE_MODEL=deepseek-ai/deepseek-coder-6.7b-instruct
+    depends_on:
+      vllm:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+    profiles:
+      - finetune
+      - all
+
+  # ────────────────────────────────────────────
+  # Training (run once, then exits)
+  # ────────────────────────────────────────────
+  trainer:
+    build:
+      context: .
+      dockerfile: approach2_finetune/Dockerfile
+    container_name: pqg-trainer
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    volumes:
+      - ./data:/app/data
+      - ./outputs:/app/outputs
+      - huggingface_cache:/root/.cache/huggingface
+    command: >
+      sh -c "python3 -m approach2_finetune.prepare_data &&
+             python3 -m approach2_finetune.train_lora --output-dir outputs/lora_adapter &&
+             python3 -m approach2_finetune.merge_adapter --adapter-path outputs/lora_adapter --output-path outputs/merged_model"
+    profiles:
+      - train
+
+volumes:
+  ollama_data:
+  huggingface_cache:

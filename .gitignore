@@ -18,8 +18,9 @@ env/
 *.swp
 *.swo
 
-# Environment
+# Environment (keep .env.local — it's a template for local GPU setups)
 .env
+!.env.local
 
 # Model artifacts
 models/

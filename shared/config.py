@@ -38,6 +38,8 @@ class Settings(BaseSettings):
     vllm_host: str = "0.0.0.0"
     vllm_port: int = 8000
     vllm_gpu_memory_utilization: float = 0.9
+    vllm_quantization: str = ""
+    vllm_max_model_len: int = 4096
 
     # Azure ML
     azure_subscription_id: str = ""
