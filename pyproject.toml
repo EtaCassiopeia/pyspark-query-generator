@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pyspark-query-generator"
+version = "0.1.0"
+description = "Generate PySpark queries from natural language using RAG or fine-tuned LLMs"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+rag = [
+    "faiss-cpu>=1.7",
+    "sentence-transformers>=2.2",
+    "httpx>=0.25",
+    "fastapi>=0.104",
+    "uvicorn[standard]>=0.24",
+]
+finetune = [
+    "torch>=2.1",
+    "transformers>=4.36",
+    "peft>=0.7",
+    "trl>=0.7",
+    "datasets>=2.16",
+    "bitsandbytes>=0.41",
+    "accelerate>=0.25",
+    "scipy",
+]
+azure = [
+    "azureml-core>=1.54",
+    "azureml-mlflow>=1.54",
+    "azure-identity>=1.15",
+    "azure-ai-ml>=1.12",
+]
+eval = [
+    "nltk>=3.8",
+    "rouge-score>=0.1",
+    "tabulate>=0.9",
+]
+dev = [
+    "pytest>=7.4",
+    "ruff>=0.1",
+    "mypy>=1.7",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true

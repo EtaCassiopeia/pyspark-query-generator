@@ -1,0 +1,30 @@
+name: pyspark-finetune
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pytorch=2.1
+  - pytorch-cuda=12.1
+  - pip
+  - pip:
+      - transformers>=4.36
+      - peft>=0.7
+      - trl>=0.7
+      - datasets>=2.16
+      - bitsandbytes>=0.41
+      - accelerate>=0.25
+      - scipy
+      - sentence-transformers>=2.2
+      - faiss-cpu>=1.7
+      - vllm
+      - pydantic>=2.0
+      - pydantic-settings>=2.0
+      - python-dotenv>=1.0
+      - fastapi>=0.104
+      - uvicorn[standard]>=0.24
+      - httpx>=0.25
+      - azureml-core>=1.54
+      - azureml-mlflow>=1.54

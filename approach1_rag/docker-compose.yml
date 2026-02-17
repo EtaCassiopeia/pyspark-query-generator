@@ -1,0 +1,40 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Pull the model on first start
+    entrypoint: >
+      sh -c "ollama serve &
+             sleep 5 &&
+             ollama pull deepseek-coder:6.7b-instruct &&
+             wait"
+
+  rag-api:
+    build:
+      context: ..
+      dockerfile: approach1_rag/Dockerfile
+    container_name: rag-api
+    ports:
+      - "8080:8080"
+    environment:
+      - LLM_BASE_URL=http://ollama:11434/v1
+      - LLM_MODEL=deepseek-coder:6.7b-instruct
+      - FAISS_INDEX_PATH=data/faiss_index
+    depends_on:
+      - ollama
+    volumes:
+      - ../data:/app/data
+
+volumes:
+  ollama_data:

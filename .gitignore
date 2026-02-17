@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+
+# Model artifacts
+models/
+*.bin
+*.safetensors
+*.gguf
+adapter_model/
+merged_model/
+
+# FAISS index
+data/faiss_index/
+*.index
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Azure ML
+azureml-models/
+outputs/
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
