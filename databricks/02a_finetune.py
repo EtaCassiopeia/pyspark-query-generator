@@ -117,25 +117,27 @@ print(response.json())
 # DBTITLE 1,Query the fine-tuned model
 import requests
 
-SYSTEM_PROMPT = """You are a PySpark query generator. Given a natural language requirement, produce a complete, runnable PySpark query.
+SYSTEM_PROMPT = """You are a PySpark query generator. Given an intake ticket with a title and description, produce a complete, runnable PySpark query.
 
 Rules:
 - Use PySpark DataFrame API (not RDD)
 - Use spark.table() to reference tables
 - Import pyspark.sql.functions as F
 - Use F.col() for column references
-- Output only the code, no explanations"""
+- Output only the code, no explanations
+- Include comments only for non-obvious logic"""
 
 
-def generate_query(requirement: str) -> str:
+def generate_query(intake_number: str, title: str, intake_description: str) -> str:
     """Call the fine-tuned model serving endpoint."""
+    user_content = f"Intake: {intake_number}\nTitle: {title}\nDescription: {intake_description}"
     response = requests.post(
         f"{DATABRICKS_HOST}/serving-endpoints/{ENDPOINT_NAME}/invocations",
         headers={"Authorization": f"Bearer {DATABRICKS_TOKEN}"},
         json={
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": requirement},
+                {"role": "user", "content": user_content},
             ],
             "max_tokens": 1024,
             "temperature": 0.1,
@@ -145,7 +147,11 @@ def generate_query(requirement: str) -> str:
 
 
 # Test it
-result = generate_query("Get total revenue by product category for the last 30 days")
+result = generate_query(
+    intake_number="INT-NEW-001",
+    title="Revenue by Product Category",
+    intake_description="Get total revenue by product category for the last 30 days"
+)
 print(result)
 
 # COMMAND ----------
@@ -159,13 +165,15 @@ val_df = spark.table(f"{CATALOG}.{SCHEMA}.validation_set").collect()
 
 results = []
 for row in val_df:
-    generated = generate_query(row["description"])
+    generated = generate_query(row["intake_number"], row["title"], row["intake_description"])
     results.append({
-        "description": row["description"],
+        "intake_number": row["intake_number"],
+        "title": row["title"],
+        "description": row["intake_description"],
         "expected": row["pyspark_query"],
         "generated": generated,
     })
 
 results_df = spark.createDataFrame(results)
-results_df.write.mode("overwrite").saveAsTable(f"{CATALOG}.{SCHEMA}.eval_results")
+results_df.write.mode("overwrite").saveAsTable(f"{CATALOG}.{SCHEMA}.finetune_eval_results")
 display(results_df)
