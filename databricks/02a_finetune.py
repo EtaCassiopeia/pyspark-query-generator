@@ -4,6 +4,9 @@
 # MAGIC
 # MAGIC Uses **Mosaic AI Fine-Tuning** to train a model on your 300 examples.
 # MAGIC
+# MAGIC Reads data via `SELECT *` (which you have access to), converts to JSONL,
+# MAGIC saves to DBFS, and passes file paths to `fm.create` (avoids table permission issues).
+# MAGIC
 # MAGIC Supported base models (check your Databricks workspace for latest list):
 # MAGIC - `meta-llama/Meta-Llama-3.1-8B-Instruct` (recommended - good at code)
 # MAGIC - `meta-llama/Meta-Llama-3.1-70B-Instruct` (better quality, more expensive)
@@ -24,20 +27,77 @@ BASE_MODEL = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 # Fine-tuned model will be registered here
 REGISTERED_MODEL_NAME = f"{CATALOG}.{SCHEMA}.pyspark_query_generator"
 
+# DBFS paths for JSONL files (fm.create can read these without table permissions)
+TRAIN_JSONL_PATH = f"dbfs:/FileStore/pyspark_gen/training_set.jsonl"
+VAL_JSONL_PATH = f"dbfs:/FileStore/pyspark_gen/validation_set.jsonl"
+
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2A.1 Launch fine-tuning run
+# MAGIC ## 2A.1 Read data via SELECT and export to JSONL
+# MAGIC
+# MAGIC Since `fm.create` cannot access the tables directly, we read the data
+# MAGIC ourselves (which works) and save as JSONL files on DBFS.
+
+# COMMAND ----------
+
+import json
+
+SYSTEM_PROMPT = """You are a PySpark query generator. Given an intake ticket with a title and description, produce a complete, runnable PySpark query.
+
+Rules:
+- Use PySpark DataFrame API (not RDD)
+- Use spark.table() to reference tables
+- Import pyspark.sql.functions as F
+- Use F.col() for column references
+- Output only the code, no explanations
+- Include comments only for non-obvious logic"""
+
+
+def to_chat_jsonl(row):
+    """Convert a row to chat completion format for fine-tuning."""
+    user_content = f"Intake: {row['intake_number']}\nTitle: {row['title']}\nDescription: {row['intake_description']}"
+    return json.dumps({
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+            {"role": "assistant", "content": row["pyspark_query"]},
+        ]
+    })
+
+# COMMAND ----------
+
+# DBTITLE 1,Read via SELECT and write JSONL to DBFS
+for split_name, dbfs_path in [("training_set", TRAIN_JSONL_PATH), ("validation_set", VAL_JSONL_PATH)]:
+    rows = spark.sql(f"SELECT intake_number, title, intake_description, pyspark_query FROM {CATALOG}.{SCHEMA}.{split_name}").collect()
+    lines = [to_chat_jsonl(row) for row in rows]
+    dbutils.fs.put(dbfs_path, "\n".join(lines), overwrite=True)
+    print(f"Wrote {len(lines)} examples to {dbfs_path}")
+
+# COMMAND ----------
+
+# Verify the files are readable
+for path in [TRAIN_JSONL_PATH, VAL_JSONL_PATH]:
+    head = dbutils.fs.head(path, 500)
+    print(f"\n--- {path} (first 500 chars) ---")
+    print(head)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 2A.2 Launch fine-tuning run
+# MAGIC
+# MAGIC Uses DBFS file paths instead of table references to avoid permission issues.
 
 # COMMAND ----------
 
 from databricks.model_training import foundation_model as fm
 
-# Launch the fine-tuning run
+# Launch the fine-tuning run using JSONL files on DBFS
 run = fm.create(
     model=BASE_MODEL,
-    train_data_path=f"{CATALOG}.{SCHEMA}.training_set",
-    eval_data_path=f"{CATALOG}.{SCHEMA}.validation_set",
+    train_data_path=TRAIN_JSONL_PATH,
+    eval_data_path=VAL_JSONL_PATH,
     register_to=REGISTERED_MODEL_NAME,
     training_duration="5ep",  # 5 epochs (good for 300 examples)
     learning_rate="5e-6",     # conservative LR for small dataset
@@ -50,7 +110,7 @@ print(f"Track progress in the Experiments UI")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2A.2 Monitor training
+# MAGIC ## 2A.3 Monitor training
 # MAGIC
 # MAGIC Training takes ~30-90 minutes depending on the model size and cluster.
 # MAGIC You can monitor in the **Experiments** tab, or poll here:
@@ -65,14 +125,13 @@ print(f"Details: {status}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2A.3 Deploy as serving endpoint
+# MAGIC ## 2A.4 Deploy as serving endpoint
 # MAGIC
 # MAGIC Once training completes, deploy the model as an API endpoint.
 
 # COMMAND ----------
 
 import requests
-import json
 
 # Get workspace URL and token
 DATABRICKS_HOST = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiUrl().get()
@@ -110,24 +169,11 @@ print(response.json())
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2A.4 Test the fine-tuned model
+# MAGIC ## 2A.5 Test the fine-tuned model
 
 # COMMAND ----------
 
 # DBTITLE 1,Query the fine-tuned model
-import requests
-
-SYSTEM_PROMPT = """You are a PySpark query generator. Given an intake ticket with a title and description, produce a complete, runnable PySpark query.
-
-Rules:
-- Use PySpark DataFrame API (not RDD)
-- Use spark.table() to reference tables
-- Import pyspark.sql.functions as F
-- Use F.col() for column references
-- Output only the code, no explanations
-- Include comments only for non-obvious logic"""
-
-
 def generate_query(intake_number: str, title: str, intake_description: str) -> str:
     """Call the fine-tuned model serving endpoint."""
     user_content = f"Intake: {intake_number}\nTitle: {title}\nDescription: {intake_description}"
@@ -157,11 +203,11 @@ print(result)
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2A.5 Evaluate on validation set
+# MAGIC ## 2A.6 Evaluate on validation set
 
 # COMMAND ----------
 
-val_df = spark.table(f"{CATALOG}.{SCHEMA}.validation_set").collect()
+val_df = spark.sql(f"SELECT * FROM {CATALOG}.{SCHEMA}.validation_set").collect()
 
 results = []
 for row in val_df:
