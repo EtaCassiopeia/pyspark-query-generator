@@ -106,15 +106,14 @@ def to_chat_jsonl(row):
         ]
     })
 
-# Collect and write JSONL files
+# Collect and write JSONL files to DBFS (accessible without Volume permissions)
 for split_name in ["training_set", "validation_set"]:
-    split_df = spark.table(f"{CATALOG}.{SCHEMA}.{split_name}")
-    rows = split_df.select("intake_number", "title", "intake_description", "pyspark_query").collect()
+    split_df = spark.sql(f"SELECT intake_number, title, intake_description, pyspark_query FROM {CATALOG}.{SCHEMA}.{split_name}")
+    rows = split_df.collect()
 
-    jsonl_path = f"/Volumes/{CATALOG}/{SCHEMA}/data/{split_name}.jsonl"
+    jsonl_path = f"dbfs:/FileStore/pyspark_gen/{split_name}.jsonl"
     lines = [to_chat_jsonl(row) for row in rows]
 
-    # Write via dbutils
     dbutils.fs.put(jsonl_path, "\n".join(lines), overwrite=True)
     print(f"Wrote {len(lines)} examples to {jsonl_path}")
 
@@ -128,4 +127,4 @@ for split_name in ["training_set", "validation_set"]:
 # MAGIC - `training_set` and `validation_set` tables (85/15 split)
 # MAGIC - JSONL files ready for fine-tuning
 # MAGIC
-# MAGIC **Next:** Run notebook `02a_finetune` for fine-tuning OR `02b_rag` for RAG approach
+# MAGIC **Next:** Run notebook `02a_finetune` for fine-tuning OR `02b_rag_faiss` / `02b_rag_databricks` for RAG
