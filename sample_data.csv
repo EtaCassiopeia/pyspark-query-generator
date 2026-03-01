@@ -1,0 +1,56 @@
+description,pyspark_query
+"Get total sales by region for Q3 2024","from pyspark.sql import functions as F
+
+df = spark.table('sales')
+result = df.filter(
+    (F.col('date') >= '2024-07-01') & (F.col('date') <= '2024-09-30')
+).groupBy('region').agg(
+    F.sum('amount').alias('total_sales')
+)
+result.show()"
+"Find customers who have not placed any order in the last 90 days","from pyspark.sql import functions as F
+from datetime import datetime, timedelta
+
+customers = spark.table('customers')
+orders = spark.table('orders')
+cutoff = (datetime.now() - timedelta(days=90)).strftime('%Y-%m-%d')
+
+recent_buyers = orders.filter(F.col('order_date') >= cutoff).select('customer_id').distinct()
+inactive = customers.join(recent_buyers, on='customer_id', how='left_anti')
+inactive.show()"
+"Calculate month-over-month revenue growth rate","from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+
+df = spark.table('revenue')
+monthly = df.groupBy(F.date_trunc('month', F.col('date')).alias('month')).agg(
+    F.sum('amount').alias('revenue')
+)
+w = Window.orderBy('month')
+result = monthly.withColumn('prev_revenue', F.lag('revenue').over(w)).withColumn(
+    'growth_rate', (F.col('revenue') - F.col('prev_revenue')) / F.col('prev_revenue') * 100
+)
+result.show()"
+"Get top 10 products by number of returns in 2024","from pyspark.sql import functions as F
+
+df = spark.table('returns')
+result = df.filter(F.year(F.col('return_date')) == 2024).groupBy('product_id', 'product_name').agg(
+    F.count('*').alias('return_count')
+).orderBy(F.desc('return_count')).limit(10)
+result.show()"
+"Join orders with customer demographics and get average order value by age group","from pyspark.sql import functions as F
+
+orders = spark.table('orders')
+customers = spark.table('customers')
+
+joined = orders.join(customers, on='customer_id')
+result = joined.withColumn(
+    'age_group',
+    F.when(F.col('age') < 25, '18-24')
+     .when(F.col('age') < 35, '25-34')
+     .when(F.col('age') < 45, '35-44')
+     .when(F.col('age') < 55, '45-54')
+     .otherwise('55+')
+).groupBy('age_group').agg(
+    F.avg('order_amount').alias('avg_order_value')
+)
+result.show()"
