@@ -2,24 +2,19 @@
 # MAGIC %md
 # MAGIC # Step 1: Data Preparation
 # MAGIC
-# MAGIC Prepare the 300 (description, query) pairs for both fine-tuning and RAG.
+# MAGIC Prepare the 300 intake tickets for both fine-tuning and RAG.
 # MAGIC Run this notebook first — both approaches depend on it.
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 1.1 Upload your CSV
 # MAGIC
-# MAGIC Upload your CSV to Databricks (Unity Catalog volume, DBFS, or workspace files).
-# MAGIC Expected columns: `description`, `pyspark_query`
-# MAGIC
-# MAGIC Option A: Use the UI — click "File > Upload Data" in the workspace
-# MAGIC Option B: Use the code below if the CSV is already in a volume
+# MAGIC Expected CSV columns:
+# MAGIC - `intake_number` — ticket/intake ID (e.g., INT-001)
+# MAGIC - `title` — short summary of the request
+# MAGIC - `intake_description` — detailed requirement description
+# MAGIC - `pyspark_query` — the PySpark code that fulfills the requirement
 
 # COMMAND ----------
 
 # DBTITLE 1,Configuration - EDIT THESE
-CATALOG = "your_catalog"          # your Unity Catalog name
+CATALOG = "your_catalog"          # run SHOW CATALOGS to find yours
 SCHEMA = "pyspark_gen"            # schema to create
 TABLE_NAME = "training_examples"  # table to store examples
 CSV_PATH = "/Volumes/your_catalog/your_schema/your_volume/your_data.csv"  # path to uploaded CSV
@@ -33,24 +28,28 @@ spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{SCHEMA}")
 
 # DBTITLE 1,Load CSV and save as Delta table
 from pyspark.sql import functions as F
-from pyspark.sql.types import StructType, StructField, StringType
 
 # Load raw CSV
 raw_df = spark.read.option("header", True).option("multiLine", True).option("escape", '"').csv(CSV_PATH)
 
 # Validate required columns
-assert "description" in raw_df.columns, "CSV must have 'description' column"
-assert "pyspark_query" in raw_df.columns, "CSV must have 'pyspark_query' column"
+required_cols = {"intake_number", "title", "intake_description", "pyspark_query"}
+missing = required_cols - set(raw_df.columns)
+assert not missing, f"CSV missing columns: {missing}. Found: {raw_df.columns}"
+
+print(f"CSV columns found: {raw_df.columns}")
 
 # Clean
 df = raw_df.select(
     F.monotonically_increasing_id().alias("id"),
-    F.trim(F.col("description")).alias("description"),
+    F.trim(F.col("intake_number")).alias("intake_number"),
+    F.trim(F.col("title")).alias("title"),
+    F.trim(F.col("intake_description")).alias("intake_description"),
     F.trim(F.col("pyspark_query")).alias("pyspark_query"),
 ).filter(
-    F.col("description").isNotNull() & F.col("pyspark_query").isNotNull()
+    F.col("intake_description").isNotNull() & F.col("pyspark_query").isNotNull()
 ).filter(
-    (F.length("description") > 10) & (F.length("pyspark_query") > 10)
+    (F.length("intake_description") > 10) & (F.length("pyspark_query") > 10)
 )
 
 print(f"Rows after cleaning: {df.count()}")
@@ -81,7 +80,7 @@ print(f"Validation set: {val_df.count()} rows")
 
 # COMMAND ----------
 
-SYSTEM_PROMPT = """You are a PySpark query generator. Given a natural language requirement, produce a complete, runnable PySpark query.
+SYSTEM_PROMPT = """You are a PySpark query generator. Given an intake ticket with a title and description, produce a complete, runnable PySpark query.
 
 Rules:
 - Use PySpark DataFrame API (not RDD)
@@ -97,11 +96,12 @@ Rules:
 import json
 
 def to_chat_jsonl(row):
-    """Convert a row to OpenAI-compatible chat format (also used by Databricks fine-tuning)."""
+    """Convert a row to chat format for fine-tuning."""
+    user_content = f"Intake: {row['intake_number']}\nTitle: {row['title']}\nDescription: {row['intake_description']}"
     return json.dumps({
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": row["description"]},
+            {"role": "user", "content": user_content},
             {"role": "assistant", "content": row["pyspark_query"]},
         ]
     })
@@ -109,7 +109,7 @@ def to_chat_jsonl(row):
 # Collect and write JSONL files
 for split_name in ["training_set", "validation_set"]:
     split_df = spark.table(f"{CATALOG}.{SCHEMA}.{split_name}")
-    rows = split_df.select("description", "pyspark_query").collect()
+    rows = split_df.select("intake_number", "title", "intake_description", "pyspark_query").collect()
 
     jsonl_path = f"/Volumes/{CATALOG}/{SCHEMA}/data/{split_name}.jsonl"
     lines = [to_chat_jsonl(row) for row in rows]
@@ -124,7 +124,7 @@ for split_name in ["training_set", "validation_set"]:
 # MAGIC ## Done!
 # MAGIC
 # MAGIC You now have:
-# MAGIC - Delta table `training_examples` with all 300 rows
+# MAGIC - Delta table with columns: `id`, `intake_number`, `title`, `intake_description`, `pyspark_query`
 # MAGIC - `training_set` and `validation_set` tables (85/15 split)
 # MAGIC - JSONL files ready for fine-tuning
 # MAGIC
