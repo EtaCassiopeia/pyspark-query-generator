@@ -1,12 +1,12 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Step 2B: RAG Approach with Databricks Vector Search
+# MAGIC # Step 2B: RAG Approach for PySpark Query Generation
 # MAGIC
-# MAGIC Uses **Databricks Vector Search** to store your 300 intake examples and
-# MAGIC **Foundation Model APIs** (DBRX / Llama / Mixtral) to generate queries.
+# MAGIC Two vector search backends available:
+# MAGIC - **Option A (preferred):** Databricks Vector Search — requires `databricks-vectorsearch` package
+# MAGIC - **Option B (active):** Open-source in-memory FAISS + sentence-transformers — no extra permissions needed
 # MAGIC
-# MAGIC Searches by `intake_description` similarity, retrieves full context
-# MAGIC (intake_number, title, description, query), and passes to LLM.
+# MAGIC Both use the same retrieval + generation pipeline.
 # MAGIC
 # MAGIC **Prerequisites:** Run notebook `01_data_prep` first.
 
@@ -17,82 +17,77 @@ CATALOG = "your_catalog"
 SCHEMA = "pyspark_gen"
 SOURCE_TABLE = f"{CATALOG}.{SCHEMA}.training_examples"
 
-# Vector search
-VS_ENDPOINT_NAME = "pyspark_gen_vs_endpoint"
-VS_INDEX_NAME = f"{CATALOG}.{SCHEMA}.examples_index"
-
 # Foundation model for generation (choose one available in your workspace)
 # Check: Workspace > Serving > Foundation Model APIs
 GENERATION_MODEL = "databricks-meta-llama-3-1-70b-instruct"  # or "databricks-dbrx-instruct"
 
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 2B.1 Enable Change Data Feed on the source table
-
-# COMMAND ----------
-
-spark.sql(f"ALTER TABLE {SOURCE_TABLE} SET TBLPROPERTIES (delta.enableChangeDataFeed = true)")
-print(f"CDF enabled on {SOURCE_TABLE}")
+# Number of similar examples to retrieve
+TOP_K = 5
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2B.2 Create Vector Search endpoint
+# MAGIC ## 2B.1 Install open-source dependencies (one-time per session)
 
 # COMMAND ----------
 
-from databricks.vector_search.client import VectorSearchClient
-
-vsc = VectorSearchClient()
-
-try:
-    vsc.create_endpoint(name=VS_ENDPOINT_NAME, endpoint_type="STANDARD")
-    print(f"Creating endpoint '{VS_ENDPOINT_NAME}'... (takes 5-10 minutes)")
-except Exception as e:
-    if "already exists" in str(e):
-        print(f"Endpoint '{VS_ENDPOINT_NAME}' already exists.")
-    else:
-        raise
+%pip install sentence-transformers faiss-cpu
 
 # COMMAND ----------
 
-# Wait for endpoint to be ready (re-run until ONLINE)
-endpoint = vsc.get_endpoint(VS_ENDPOINT_NAME)
-print(f"Endpoint status: {endpoint}")
+dbutils.library.restartPython()
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2B.3 Create Vector Search index
+# MAGIC ## 2B.2 Load data from Delta table
+
+# COMMAND ----------
+
+# Re-declare config after restartPython (kernel state is cleared)
+CATALOG = "your_catalog"
+SCHEMA = "pyspark_gen"
+SOURCE_TABLE = f"{CATALOG}.{SCHEMA}.training_examples"
+GENERATION_MODEL = "databricks-meta-llama-3-1-70b-instruct"
+TOP_K = 5
+
+# COMMAND ----------
+
+# Load training examples into pandas (300 rows fits easily in memory)
+pdf = spark.table(SOURCE_TABLE).toPandas()
+print(f"Loaded {len(pdf)} examples")
+pdf[["intake_number", "title", "intake_description"]].head()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 2B.3 Build in-memory vector index (FAISS + sentence-transformers)
 # MAGIC
-# MAGIC Embeds `intake_description` for semantic search.
-# MAGIC Retrieves all columns (intake_number, title, description, query).
+# MAGIC Uses `all-MiniLM-L6-v2` — a small (~80MB) embedding model that runs
+# MAGIC locally on the driver node. No API calls, no permissions needed.
 
 # COMMAND ----------
 
-try:
-    index = vsc.create_delta_sync_index(
-        endpoint_name=VS_ENDPOINT_NAME,
-        index_name=VS_INDEX_NAME,
-        source_table_name=SOURCE_TABLE,
-        pipeline_type="TRIGGERED",
-        primary_key="id",
-        embedding_source_columns=["intake_description"],
-        embedding_model_endpoint_name="databricks-bge-large-en",
-    )
-    print(f"Index '{VS_INDEX_NAME}' created. Syncing...")
-except Exception as e:
-    if "already exists" in str(e):
-        print(f"Index '{VS_INDEX_NAME}' already exists.")
-        index = vsc.get_index(VS_ENDPOINT_NAME, VS_INDEX_NAME)
-    else:
-        raise
+import numpy as np
+import faiss
+from sentence_transformers import SentenceTransformer
 
-# COMMAND ----------
+# Load embedding model (downloads ~80MB on first run, cached after)
+print("Loading embedding model 'all-MiniLM-L6-v2'...")
+embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+print("Model ready.")
 
-index.sync()
-print(index.describe())
+# Embed all intake descriptions
+descriptions = pdf["intake_description"].tolist()
+print(f"Embedding {len(descriptions)} intake descriptions...")
+embeddings = embed_model.encode(descriptions, normalize_embeddings=True, show_progress_bar=True)
+embeddings = embeddings.astype("float32")
+
+# Build FAISS index (inner product on normalized vectors = cosine similarity)
+dim = embeddings.shape[1]
+faiss_index = faiss.IndexFlatIP(dim)
+faiss_index.add(embeddings)
+print(f"FAISS index built: {faiss_index.ntotal} vectors, dim={dim}")
 
 # COMMAND ----------
 
@@ -101,17 +96,31 @@ print(index.describe())
 
 # COMMAND ----------
 
-results = index.similarity_search(
-    query_text="Get average order value per customer segment",
-    columns=["intake_number", "title", "intake_description", "pyspark_query"],
-    num_results=5,
-)
+def retrieve_examples(requirement: str, top_k: int = TOP_K) -> list:
+    """Find the top-k most similar intake examples using FAISS."""
+    query_vec = embed_model.encode([requirement], normalize_embeddings=True).astype("float32")
+    scores, indices = faiss_index.search(query_vec, top_k)
 
-for row in results["result"]["data_array"]:
-    print(f"Score: {row[-1]:.3f}")
-    print(f"Intake: {row[0]} | Title: {row[1]}")
-    print(f"Description: {row[2][:100]}...")
-    print(f"Query: {row[3][:80]}...")
+    results = []
+    for score, idx in zip(scores[0], indices[0]):
+        row = pdf.iloc[idx]
+        results.append({
+            "intake_number": row["intake_number"],
+            "title": row["title"],
+            "intake_description": row["intake_description"],
+            "pyspark_query": row["pyspark_query"],
+            "score": float(score),
+        })
+    return results
+
+# COMMAND ----------
+
+# Test retrieval
+test_results = retrieve_examples("Get average order value per customer segment")
+
+for r in test_results:
+    print(f"Score: {r['score']:.3f} | {r['intake_number']} | {r['title']}")
+    print(f"  {r['intake_description'][:100]}...")
     print("-" * 50)
 
 # COMMAND ----------
@@ -122,7 +131,6 @@ for row in results["result"]["data_array"]:
 # COMMAND ----------
 
 import requests
-import json
 
 DATABRICKS_HOST = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiUrl().get()
 DATABRICKS_TOKEN = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken().get()
@@ -140,26 +148,7 @@ Rules:
 - Include comments only for non-obvious logic"""
 
 
-def retrieve_examples(requirement: str, top_k: int = 5) -> list[dict]:
-    """Retrieve the most similar intake examples from Vector Search."""
-    results = index.similarity_search(
-        query_text=requirement,
-        columns=["intake_number", "title", "intake_description", "pyspark_query"],
-        num_results=top_k,
-    )
-    examples = []
-    for row in results["result"]["data_array"]:
-        examples.append({
-            "intake_number": row[0],
-            "title": row[1],
-            "intake_description": row[2],
-            "pyspark_query": row[3],
-            "score": row[-1],
-        })
-    return examples
-
-
-def build_prompt(requirement: str, examples: list[dict]) -> str:
+def build_prompt(requirement: str, examples: list) -> str:
     """Format retrieved intake examples into the user message."""
     examples_text = ""
     for i, ex in enumerate(examples, 1):
@@ -178,12 +167,15 @@ def build_prompt(requirement: str, examples: list[dict]) -> str:
 Generate the PySpark query:"""
 
 
-def generate_query(requirement: str, top_k: int = 5) -> str:
+def generate_query(requirement: str, top_k: int = TOP_K) -> str:
     """Full RAG pipeline: retrieve similar intakes, then generate."""
+    # 1. Retrieve similar examples via FAISS
     examples = retrieve_examples(requirement, top_k)
 
+    # 2. Build prompt with examples as context
     user_message = build_prompt(requirement, examples)
 
+    # 3. Generate via Foundation Model API
     response = requests.post(
         f"{DATABRICKS_HOST}/serving-endpoints/{GENERATION_MODEL}/invocations",
         headers={"Authorization": f"Bearer {DATABRICKS_TOKEN}"},
@@ -228,10 +220,10 @@ for req in test_requirements:
 
 # COMMAND ----------
 
-val_df = spark.table(f"{CATALOG}.{SCHEMA}.validation_set").collect()
+val_rows = spark.table(f"{CATALOG}.{SCHEMA}.validation_set").collect()
 
 results = []
-for row in val_df:
+for row in val_rows:
     generated = generate_query(row["intake_description"])
     results.append({
         "intake_number": row["intake_number"],
@@ -244,3 +236,103 @@ for row in val_df:
 results_df = spark.createDataFrame(results)
 results_df.write.mode("overwrite").saveAsTable(f"{CATALOG}.{SCHEMA}.rag_eval_results")
 display(results_df)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ---
+# MAGIC # APPENDIX: Databricks Vector Search (preferred, currently disabled)
+# MAGIC
+# MAGIC If you get access to `databricks-vectorsearch`, uncomment and use these cells
+# MAGIC instead of the FAISS sections above. This approach auto-syncs with your Delta
+# MAGIC table and doesn't require re-embedding on every notebook restart.
+# MAGIC
+# MAGIC ## Setup
+# MAGIC ```
+# MAGIC %pip install databricks-vectorsearch
+# MAGIC dbutils.library.restartPython()
+# MAGIC ```
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### A.1 Enable Change Data Feed
+
+# COMMAND ----------
+
+# # spark.sql(f"ALTER TABLE {SOURCE_TABLE} SET TBLPROPERTIES (delta.enableChangeDataFeed = true)")
+# # print(f"CDF enabled on {SOURCE_TABLE}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### A.2 Create Vector Search endpoint
+
+# COMMAND ----------
+
+# # from databricks.vector_search.client import VectorSearchClient
+# #
+# # vsc = VectorSearchClient()
+# #
+# # try:
+# #     vsc.create_endpoint(name="pyspark_gen_vs_endpoint", endpoint_type="STANDARD")
+# #     print("Creating endpoint... (takes 5-10 minutes)")
+# # except Exception as e:
+# #     if "already exists" in str(e):
+# #         print("Endpoint already exists.")
+# #     else:
+# #         raise
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### A.3 Create Vector Search index
+
+# COMMAND ----------
+
+# # VS_INDEX_NAME = f"{CATALOG}.{SCHEMA}.examples_index"
+# #
+# # try:
+# #     index = vsc.create_delta_sync_index(
+# #         endpoint_name="pyspark_gen_vs_endpoint",
+# #         index_name=VS_INDEX_NAME,
+# #         source_table_name=SOURCE_TABLE,
+# #         pipeline_type="TRIGGERED",
+# #         primary_key="id",
+# #         embedding_source_columns=["intake_description"],
+# #         embedding_model_endpoint_name="databricks-bge-large-en",
+# #     )
+# #     print(f"Index created. Syncing...")
+# # except Exception as e:
+# #     if "already exists" in str(e):
+# #         print("Index already exists.")
+# #         index = vsc.get_index("pyspark_gen_vs_endpoint", VS_INDEX_NAME)
+# #     else:
+# #         raise
+# #
+# # index.sync()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### A.4 Retrieval using Vector Search
+# MAGIC
+# MAGIC Replace the `retrieve_examples` function with this version:
+# MAGIC ```python
+# MAGIC def retrieve_examples(requirement, top_k=5):
+# MAGIC     results = index.similarity_search(
+# MAGIC         query_text=requirement,
+# MAGIC         columns=["intake_number", "title", "intake_description", "pyspark_query"],
+# MAGIC         num_results=top_k,
+# MAGIC     )
+# MAGIC     examples = []
+# MAGIC     for row in results["result"]["data_array"]:
+# MAGIC         examples.append({
+# MAGIC             "intake_number": row[0],
+# MAGIC             "title": row[1],
+# MAGIC             "intake_description": row[2],
+# MAGIC             "pyspark_query": row[3],
+# MAGIC             "score": row[-1],
+# MAGIC         })
+# MAGIC     return examples
+# MAGIC ```
