@@ -1,12 +1,11 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Step 2B: RAG Approach for PySpark Query Generation
+# MAGIC # Step 2B-i: RAG with FAISS + sentence-transformers (Open Source)
 # MAGIC
-# MAGIC Two vector search backends available:
-# MAGIC - **Option A (preferred):** Databricks Vector Search — requires `databricks-vectorsearch` package
-# MAGIC - **Option B (active):** Open-source in-memory FAISS + sentence-transformers — no extra permissions needed
+# MAGIC Uses open-source `all-MiniLM-L6-v2` for embeddings and FAISS for in-memory
+# MAGIC vector search. No extra permissions or managed services needed.
 # MAGIC
-# MAGIC Both use the same retrieval + generation pipeline.
+# MAGIC **Trade-off:** Index is rebuilt on every notebook restart (~5 sec for 300 rows).
 # MAGIC
 # MAGIC **Prerequisites:** Run notebook `01_data_prep` first.
 
@@ -27,7 +26,7 @@ TOP_K = 5
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2B.1 Install open-source dependencies (one-time per session)
+# MAGIC ## 1. Install dependencies (one-time per session)
 
 # COMMAND ----------
 
@@ -40,7 +39,7 @@ dbutils.library.restartPython()
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2B.2 Load data from Delta table
+# MAGIC ## 2. Load data from Delta table
 
 # COMMAND ----------
 
@@ -61,7 +60,7 @@ pdf[["intake_number", "title", "intake_description"]].head()
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2B.3 Build in-memory vector index (FAISS + sentence-transformers)
+# MAGIC ## 3. Build in-memory vector index
 # MAGIC
 # MAGIC Uses `all-MiniLM-L6-v2` — a small (~80MB) embedding model that runs
 # MAGIC locally on the driver node. No API calls, no permissions needed.
@@ -92,7 +91,7 @@ print(f"FAISS index built: {faiss_index.ntotal} vectors, dim={dim}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2B.4 Test retrieval
+# MAGIC ## 4. Test retrieval
 
 # COMMAND ----------
 
@@ -126,7 +125,7 @@ for r in test_results:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2B.5 RAG pipeline — retrieve + generate
+# MAGIC ## 5. RAG pipeline — retrieve + generate
 
 # COMMAND ----------
 
@@ -216,7 +215,7 @@ for req in test_requirements:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2B.6 Evaluate on validation set
+# MAGIC ## 6. Evaluate on validation set
 
 # COMMAND ----------
 
@@ -234,105 +233,5 @@ for row in val_rows:
     })
 
 results_df = spark.createDataFrame(results)
-results_df.write.mode("overwrite").saveAsTable(f"{CATALOG}.{SCHEMA}.rag_eval_results")
+results_df.write.mode("overwrite").saveAsTable(f"{CATALOG}.{SCHEMA}.rag_faiss_eval_results")
 display(results_df)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ---
-# MAGIC # APPENDIX: Databricks Vector Search (preferred, currently disabled)
-# MAGIC
-# MAGIC If you get access to `databricks-vectorsearch`, uncomment and use these cells
-# MAGIC instead of the FAISS sections above. This approach auto-syncs with your Delta
-# MAGIC table and doesn't require re-embedding on every notebook restart.
-# MAGIC
-# MAGIC ## Setup
-# MAGIC ```
-# MAGIC %pip install databricks-vectorsearch
-# MAGIC dbutils.library.restartPython()
-# MAGIC ```
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### A.1 Enable Change Data Feed
-
-# COMMAND ----------
-
-# # spark.sql(f"ALTER TABLE {SOURCE_TABLE} SET TBLPROPERTIES (delta.enableChangeDataFeed = true)")
-# # print(f"CDF enabled on {SOURCE_TABLE}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### A.2 Create Vector Search endpoint
-
-# COMMAND ----------
-
-# # from databricks.vector_search.client import VectorSearchClient
-# #
-# # vsc = VectorSearchClient()
-# #
-# # try:
-# #     vsc.create_endpoint(name="pyspark_gen_vs_endpoint", endpoint_type="STANDARD")
-# #     print("Creating endpoint... (takes 5-10 minutes)")
-# # except Exception as e:
-# #     if "already exists" in str(e):
-# #         print("Endpoint already exists.")
-# #     else:
-# #         raise
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### A.3 Create Vector Search index
-
-# COMMAND ----------
-
-# # VS_INDEX_NAME = f"{CATALOG}.{SCHEMA}.examples_index"
-# #
-# # try:
-# #     index = vsc.create_delta_sync_index(
-# #         endpoint_name="pyspark_gen_vs_endpoint",
-# #         index_name=VS_INDEX_NAME,
-# #         source_table_name=SOURCE_TABLE,
-# #         pipeline_type="TRIGGERED",
-# #         primary_key="id",
-# #         embedding_source_columns=["intake_description"],
-# #         embedding_model_endpoint_name="databricks-bge-large-en",
-# #     )
-# #     print(f"Index created. Syncing...")
-# # except Exception as e:
-# #     if "already exists" in str(e):
-# #         print("Index already exists.")
-# #         index = vsc.get_index("pyspark_gen_vs_endpoint", VS_INDEX_NAME)
-# #     else:
-# #         raise
-# #
-# # index.sync()
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### A.4 Retrieval using Vector Search
-# MAGIC
-# MAGIC Replace the `retrieve_examples` function with this version:
-# MAGIC ```python
-# MAGIC def retrieve_examples(requirement, top_k=5):
-# MAGIC     results = index.similarity_search(
-# MAGIC         query_text=requirement,
-# MAGIC         columns=["intake_number", "title", "intake_description", "pyspark_query"],
-# MAGIC         num_results=top_k,
-# MAGIC     )
-# MAGIC     examples = []
-# MAGIC     for row in results["result"]["data_array"]:
-# MAGIC         examples.append({
-# MAGIC             "intake_number": row[0],
-# MAGIC             "title": row[1],
-# MAGIC             "intake_description": row[2],
-# MAGIC             "pyspark_query": row[3],
-# MAGIC             "score": row[-1],
-# MAGIC         })
-# MAGIC     return examples
-# MAGIC ```
