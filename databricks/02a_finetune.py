@@ -4,8 +4,11 @@
 # MAGIC
 # MAGIC Uses **Mosaic AI Fine-Tuning** to train a model on your 300 examples.
 # MAGIC
-# MAGIC Reads data via `SELECT *` (which you have access to), converts to JSONL,
-# MAGIC saves to DBFS, and passes file paths to `fm.create` (avoids table permission issues).
+# MAGIC `fm.create` only accepts **Unity Catalog tables** or **UC Volume paths** (not DBFS).
+# MAGIC This notebook tries three approaches in order:
+# MAGIC 1. **UC Volume** — create a volume, write JSONL there
+# MAGIC 2. **Delta table with `messages` column** — write training data as a table fm.create can read
+# MAGIC 3. If both fail, you'll need admin help
 # MAGIC
 # MAGIC Supported base models (check your Databricks workspace for latest list):
 # MAGIC - `meta-llama/Meta-Llama-3.1-8B-Instruct` (recommended - good at code)
@@ -27,21 +30,16 @@ BASE_MODEL = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 # Fine-tuned model will be registered here
 REGISTERED_MODEL_NAME = f"{CATALOG}.{SCHEMA}.pyspark_query_generator"
 
-# DBFS paths for JSONL files (fm.create can read these without table permissions)
-TRAIN_JSONL_PATH = f"dbfs:/FileStore/pyspark_gen/training_set.jsonl"
-VAL_JSONL_PATH = f"dbfs:/FileStore/pyspark_gen/validation_set.jsonl"
-
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2A.1 Read data via SELECT and export to JSONL
-# MAGIC
-# MAGIC Since `fm.create` cannot access the tables directly, we read the data
-# MAGIC ourselves (which works) and save as JSONL files on DBFS.
+# MAGIC ## 2A.1 Prepare training data
 
 # COMMAND ----------
 
 import json
+from pyspark.sql import Row
+from pyspark.sql.types import StructType, StructField, StringType, ArrayType
 
 SYSTEM_PROMPT = """You are a PySpark query generator. Given an intake ticket with a title and description, produce a complete, runnable PySpark query.
 
@@ -54,63 +52,119 @@ Rules:
 - Include comments only for non-obvious logic"""
 
 
-def to_chat_jsonl(row):
-    """Convert a row to chat completion format for fine-tuning."""
+def make_messages(row):
+    """Build the chat messages array for one training example."""
     user_content = f"Intake: {row['intake_number']}\nTitle: {row['title']}\nDescription: {row['intake_description']}"
-    return json.dumps({
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-            {"role": "assistant", "content": row["pyspark_query"]},
-        ]
-    })
-
-# COMMAND ----------
-
-# DBTITLE 1,Read via SELECT and write JSONL to DBFS
-for split_name, dbfs_path in [("training_set", TRAIN_JSONL_PATH), ("validation_set", VAL_JSONL_PATH)]:
-    rows = spark.sql(f"SELECT intake_number, title, intake_description, pyspark_query FROM {CATALOG}.{SCHEMA}.{split_name}").collect()
-    lines = [to_chat_jsonl(row) for row in rows]
-    dbutils.fs.put(dbfs_path, "\n".join(lines), overwrite=True)
-    print(f"Wrote {len(lines)} examples to {dbfs_path}")
-
-# COMMAND ----------
-
-# Verify the files are readable
-for path in [TRAIN_JSONL_PATH, VAL_JSONL_PATH]:
-    head = dbutils.fs.head(path, 500)
-    print(f"\n--- {path} (first 500 chars) ---")
-    print(head)
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+        {"role": "assistant", "content": row["pyspark_query"]},
+    ]
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2A.2 Launch fine-tuning run
+# MAGIC ## 2A.2 Try Approach A: UC Volume (recommended by Databricks)
 # MAGIC
-# MAGIC Uses DBFS file paths instead of table references to avoid permission issues.
+# MAGIC Creates a volume in your schema and writes JSONL files there.
+# MAGIC `fm.create` natively supports `/Volumes/...` paths.
+
+# COMMAND ----------
+
+# DBTITLE 1,Create UC Volume and write JSONL
+VOLUME_NAME = "ft_data"
+VOLUME_PATH = f"/Volumes/{CATALOG}/{SCHEMA}/{VOLUME_NAME}"
+TRAIN_JSONL = f"{VOLUME_PATH}/training_set.jsonl"
+VAL_JSONL = f"{VOLUME_PATH}/validation_set.jsonl"
+
+volume_ok = False
+
+try:
+    spark.sql(f"CREATE VOLUME IF NOT EXISTS {CATALOG}.{SCHEMA}.{VOLUME_NAME}")
+    print(f"Volume created: {CATALOG}.{SCHEMA}.{VOLUME_NAME}")
+
+    for split_name, jsonl_path in [("training_set", TRAIN_JSONL), ("validation_set", VAL_JSONL)]:
+        rows = spark.sql(
+            f"SELECT intake_number, title, intake_description, pyspark_query FROM {CATALOG}.{SCHEMA}.{split_name}"
+        ).collect()
+        lines = [json.dumps({"messages": make_messages(row)}) for row in rows]
+        dbutils.fs.put(jsonl_path, "\n".join(lines), overwrite=True)
+        print(f"Wrote {len(lines)} examples to {jsonl_path}")
+
+    # Verify
+    print(f"\nVerifying: {dbutils.fs.head(TRAIN_JSONL, 300)[:300]}...")
+    volume_ok = True
+
+except Exception as e:
+    print(f"Volume approach failed: {e}")
+    print("Falling back to Approach B (Delta table)...")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 2A.3 Fallback Approach B: Delta table with `messages` column
+# MAGIC
+# MAGIC If you can't create a volume, this writes the training data as a Delta table
+# MAGIC with the schema `fm.create` expects: a single `messages` column containing
+# MAGIC the JSON string of the chat messages array.
+
+# COMMAND ----------
+
+if not volume_ok:
+    from pyspark.sql import functions as F
+
+    for split_name in ["training_set", "validation_set"]:
+        rows = spark.sql(
+            f"SELECT intake_number, title, intake_description, pyspark_query FROM {CATALOG}.{SCHEMA}.{split_name}"
+        ).collect()
+
+        # Build rows with a single "messages" column (JSON string)
+        ft_rows = [Row(messages=json.dumps(make_messages(row))) for row in rows]
+        ft_df = spark.createDataFrame(ft_rows)
+
+        ft_table = f"{CATALOG}.{SCHEMA}.{split_name}_ft"
+        ft_df.write.mode("overwrite").saveAsTable(ft_table)
+        print(f"Wrote {len(ft_rows)} examples to table {ft_table}")
+
+    print("\nWill use table paths for fm.create")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 2A.4 Launch fine-tuning run
 
 # COMMAND ----------
 
 from databricks.model_training import foundation_model as fm
 
-# Launch the fine-tuning run using JSONL files on DBFS
+if volume_ok:
+    # Approach A: JSONL files in UC Volume
+    train_path = TRAIN_JSONL
+    val_path = VAL_JSONL
+    print(f"Using UC Volume paths:\n  train: {train_path}\n  val:   {val_path}")
+else:
+    # Approach B: Delta tables with messages column
+    train_path = f"{CATALOG}.{SCHEMA}.training_set_ft"
+    val_path = f"{CATALOG}.{SCHEMA}.validation_set_ft"
+    print(f"Using Delta table paths:\n  train: {train_path}\n  val:   {val_path}")
+
 run = fm.create(
     model=BASE_MODEL,
-    train_data_path=TRAIN_JSONL_PATH,
-    eval_data_path=VAL_JSONL_PATH,
+    train_data_path=train_path,
+    eval_data_path=val_path,
     register_to=REGISTERED_MODEL_NAME,
     training_duration="5ep",  # 5 epochs (good for 300 examples)
     learning_rate="5e-6",     # conservative LR for small dataset
 )
 
-print(f"Fine-tuning run launched!")
+print(f"\nFine-tuning run launched!")
 print(f"Run name: {run.name}")
 print(f"Track progress in the Experiments UI")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2A.3 Monitor training
+# MAGIC ## 2A.5 Monitor training
 # MAGIC
 # MAGIC Training takes ~30-90 minutes depending on the model size and cluster.
 # MAGIC You can monitor in the **Experiments** tab, or poll here:
@@ -125,7 +179,7 @@ print(f"Details: {status}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2A.4 Deploy as serving endpoint
+# MAGIC ## 2A.6 Deploy as serving endpoint
 # MAGIC
 # MAGIC Once training completes, deploy the model as an API endpoint.
 
@@ -169,7 +223,7 @@ print(response.json())
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2A.5 Test the fine-tuned model
+# MAGIC ## 2A.7 Test the fine-tuned model
 
 # COMMAND ----------
 
@@ -203,7 +257,7 @@ print(result)
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2A.6 Evaluate on validation set
+# MAGIC ## 2A.8 Evaluate on validation set
 
 # COMMAND ----------
 
